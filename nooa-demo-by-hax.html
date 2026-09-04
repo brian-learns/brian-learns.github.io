@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Hello, world!</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <meta name="description" content="" />
+  <link rel="icon" href="favicon.ico">
+  <!-- Runs before the stylesheet so the theme is applied before first paint. -->
+  <script src="https://brian-learns.github.io/markdiv/dist/markdiv.min.js"></script>
+  <link rel="stylesheet" href="https://brian-learns.github.io/markdiv/dist/markdiv.min.css">
+</head>
+<body>
+<h1>agent to agent</h1>
+  <div>using hax to explore NVIDIA Object Oriented Agents</div>
+  <section data-format="markdown" style="font-size: 150%;">
+I've been using [Oleksandr Chekhovskyi](https://github.com/OleksandrChekhovskyi)'s [hax](https://github.com/OleksandrChekhovskyi/hax) as my coding agent, hooked to a local Qwen3.8 27B.
+
+I wanted to take a look at [NVIDIA's Object Oriented Agents](https://github.com/nvidia-nemo/labs-OO-Agents), so I asked hax to create an example using a couple of toy agent skills/tools I've been working on.
+
+It created two sample agents that use my [`xng`](https://github.com/brian-learns/xng) and [`ccnget`](https://github.com/brian-learns/ccnget) and says it did end to end tests with my local llama-server in rounter mode.
+
+Below is a blog post I asked Qwen3.8 27B to write about what we learned (the agent it wrote and ran was using Qwen 3.6 27B).
+
+This actually happened Friday September 4th, 2026, and a couple of details I think are wrong (like nooa and nooa-memery were on pypi, and the pages about SearXNG in the test are not in common crawl news), but it was sort of cool so see one agent write another.
+
+https://github.com/brian-learns/nooa-demo-by-hax
+
+  </section>
+  <hr/>
+  <section data-format="markdown">
+	
+# Agents as Python Objects: A Local-First NOOA Experiment
+
+*July 23, 2026*
+
+Last week NVIDIA published [NVIDIA Object-Oriented Agents (NOOA)](https://arxiv.org/abs/2607.20709)
+(arXiv:2607.20709), a model-agnostic Python framework with a single, radical premise:
+
+> **An agent is a Python object.** Its methods are the actions the model can take, its fields
+> are its state, its docstrings are its prompts, and its type annotations are its contracts.
+
+The interesting part is the split: a method with a real body is deterministic Python, while a
+method whose body is just `...` becomes an *agentic method* — completed at runtime by an
+LLM-driven loop. Developers and the model get the same interface.
+
+I wanted to test this on my own hardware, with my own tools, no cloud keys required. Here's
+what we built and what we learned.
+
+## The setup
+
+Everything runs locally:
+
+| Piece | What it is |
+|---|---|
+| **LLM** | `Qwen3.6-27B-NVFP4-GGUF` served by a local `llama-server` router (OpenAI-compatible) at `http://0.0.0.0:8080/v1` |
+| **Search** | A local SearXNG instance, accessed through the `xng` Python API |
+| **Archives** | The Common Crawl News index (1.4B+ archived news pages) via a local CDX server and the `ccnget` Python API, with a public index as fallback |
+| **Framework** | `nooa` + `nooa-memory`, installed from the [nvidia-nemo/labs-OO-Agents](https://github.com/nvidia-nemo/labs-OO-Agents) repo (not on PyPI yet) |
+
+The two "tools" the agent gets are ordinary Python libraries. `xng.search("query")` returns
+structured search hits; `ccnget.article(url)` looks a URL up in the CDX index, pulls the WARC
+record, and extracts the archived page to markdown with metadata. No tool schemas, no function
+calling definitions, no prompt templates — just imports.
+
+## The agent
+
+The whole thing is one class:
+
+```python
+class WebArchivistAgent(MemoryToolsMixin, Agent, llm=llm):
+    """You are a web research agent with long-term memory. Consult what you
+    already remember before fetching anything. Prefer archived copies of pages
+    from the Common Crawl News index, and synthesize a cited report."""
+
+    findings: list[ArchiveDoc]      # model-visible state
+    cdx_url: str | None
+
+    # --- Deterministic tools: ordinary Python, callable by the model ---
+
+    def search_web(self, query: str, limit: int = 5) -> list[Hit]:
+        """Search the live web via SearXNG. Returns title, url, snippet and
+        published date for each hit."""
+        resp = xng.search(query, limit=limit)
+        return [Hit(h.title, h.url, h.content or "", h.published_date)
+                for h in resp.results[:limit]]
+
+    def fetch_archive(self, url: str, max_chars: int = 4000) -> ArchiveDoc:
+        """Fetch the archived version of a URL from the Common Crawl News index
+        and extract it as a markdown article. Raises if no archive match exists."""
+        res = ccnget.article(url, cdx_url=self.cdx_url)
+        ...
+
+    # --- Agentic method: the LLM writes Python in a loop until it can return ---
+
+    @strategy(CodeActStrategy())
+    async def research(self, topic: str) -> ResearchReport:
+        """Research {topic}. First call self.recall(topic) and build on what you
+        already remember — do not refetch pages you already have in memory.
+        Then search the web, fetch archived copies ... Before returning, store
+        each durable fact you learned with self.remember(...) ..."""
+        ...
+```
+
+That's the entire programming model. When the model runs `research`, it sits in a
+Jupyter-like REPL where `self` and the task's inputs are live objects. It can call
+`self.search_web(...)`, `self.fetch_archive(...)`, `self.recall(...)`, `self.remember(...)` —
+real Python against real objects, not serialized JSON. When it's done it calls
+`return_result(value)`, and the harness validates the value against the declared return type
+(`ResearchReport`, a Pydantic model) before handing it back to us.
+
+Here's the surface the model actually sees (`doc(type(self))`), which is a good illustration
+of how "prompt engineering" collapses into "write good docstrings":
+
+```python
+class WebArchivistAgent:
+    """You are a web research agent with long-term memory. ..."""
+
+    findings: list[ArchiveDoc]
+    cdx_url: str | None
+
+    def search_web(self, query: str, limit: int = 5) -> list[Hit]:
+        """Search the live web via SearXNG. ..."""
+    def fetch_archive(self, url: str, max_chars: int = 4000) -> ArchiveDoc:
+        """Fetch the archived version of a URL from the Common Crawl News index ..."""
+    async def research(self, topic: str) -> ResearchReport:
+        """Research {topic}. First call self.recall(topic) ..."""
+```
+
+## Adding long-term memory
+
+`nooa-memory` is an opt-in, additive subsystem — the agent class only gains a mixin and a
+two-line install:
+
+```python
+class WebArchivistAgent(MemoryToolsMixin, Agent, llm=llm): ...
+
+mgr = MemoryManager.install(
+    agent,
+    config=MemoryConfig(enabled=True, path="examples/data/archivist_memory.sqlite"),
+)
+```
+
+That's it. The agent now has conscious tools — `remember()`, `recall()`, `update_memory()`,
+`forget()` — and, with the default `instruct=True`, a context block telling it it owns its
+memory and showing it the schema. Memory is brain-inspired in the small details: embeddings
+for associative recall (a deterministic offline hashing embedder by default, so it works with
+no /embeddings endpoint), dedup-on-write (encoding the same fact twice *reinforces* the
+existing memory instead of duplicating it), spontaneous association (relevant memories
+injected from recent task context), and post-task episodes written automatically for offline
+reflection.
+
+## What happened
+
+**Run 1 — fresh database.** Topic: *"What is SearXNG and why do people self-host it?"*
+The agent searched SearXNG, fetched two archived documents through the CDX index
+(captures from 2026 and 2025 — the archived bodies, not the live pages), synthesized a
+validated `ResearchReport` with seven cited key facts, and wrote 5 memories
+(4 facts + 1 auto episode). **2m45s end to end.**
+
+**Run 2 — same topic, same database, new process.** The store started with those 5 memories.
+The report's `from_memory` field — a field I added precisely to test this — came back with
+**six facts taken from memory instead of a fresh fetch**, and the store grew only 5→8: the
+duplicate facts hit dedup-on-write and were reinforced rather than duplicated. **3m19s.**
+
+The store afterward: 6 `info` memories and 2 `episode` memories, one per run.
+
+## What we learned
+
+**The model used the interface well.** With a 27B GGUF on local hardware — not the frontier
+models the paper benchmarks — the CodeAct loop did the right thing: search → pick sources →
+fetch archives → handle `NotFoundError` on non-news URLs (GitHub and searxng.org *are* in the
+CC-News index; random blog posts aren't, and the agent fell back instead of inventing content)
+→ synthesize → remember. The return-type contract did real work: the report came back as a
+validated Pydantic object, every key fact with a source URL, no schema drift.
+
+**The docstring is the prompt, and it shows.** The agent's behavior tracked the docstrings
+almost literally — "cite a URL for each key fact" produced cited facts; "one memory per fact"
+produced atomic memories. Refactoring agent behavior is now refactoring code, which is a
+genuinely different development experience from prompt-template archaeology.
+
+**Memory recall worked; fetch suppression mostly didn't.** Run 2 recalled six facts from
+memory, but it *also* re-fetched four documents the model arguably already knew about. The
+27B model didn't fully honor "do not refetch pages you already have in memory." The
+interesting fix isn't a better prompt — it's moving that decision out of the loop, which the
+framework makes easy: a deterministic `fetch_archive` could check memory first, or a
+precondition could short-circuit. This is exactly the paper's principle P3 in action: LLMs
+are for semantic judgment; exact rules belong in Python.
+
+**Local-first is viable, with caveats.** A few environment notes worth carrying forward:
+
+- `nooa`'s `pyproject.toml` says `requires-python >=3.12,<3.14`; our venv was 3.14 and it
+  worked fine — but pin your Python if you want to be safe.
+- The package isn't on PyPI; install from the GitHub repo.
+- For a thinking model like Qwen3.6, disable reasoning tokens for agent loops — every CodeAct
+  turn is a full chat completion, and `chat_template_kwargs: {"enable_thinking": false}`
+  (passed through litellm's `extra_body`) made each turn many times cheaper. The model's
+  agentic behavior didn't suffer.
+- The deterministic hashing embedder is a fine default for local memory; semantic recall will
+  get measurably better if you wire `EmbeddingConfig(backend="litellm", ...)` to a real
+  embedding endpoint.
+
+**What this didn't test:** multi-agent fan-out (`asyncio.gather` over `@strategy` subagents),
+tracing, skills-as-modules, and the benchmarks the paper reports (SWE-bench Verified,
+Terminal-Bench 2.0, ARC-AGI-3). And honestly: a 27B parameter local model is the
+weakest link — on the paper's own stress tests, capability scales with model size: on
+`sentiment_batch`, their hardest test, small/efficient models passed 40% of runs versus
+76.7% for large/frontier models.
+
+## Reproduce it
+
+```bash
+# repo checkout + packages in a venv (xng, ccnget also installed)
+git clone https://github.com/nvidia-nemo/labs-OO-Agents
+
+# base agent: web search + CC-News archives (any LLM via litellm naming)
+~/.venv/bin/python examples/archivist_agent.py "your topic"
+
+# same agent + persistent nooa-memory; run twice with the same topic
+~/.venv/bin/python examples/archivist_memory.py "your topic"
+~/.venv/bin/python examples/archivist_memory.py "your topic"   # watch from_memory fill
+```
+
+You need: a llama-server (or any OpenAI-compatible endpoint, via `NOOA_MODEL`/`NOOA_LLM_BASE`),
+a SearXNG instance, and a CC-News CDX server (or the public fallback index).
+
+---
+
+*The paper's thesis is that agent frameworks keep reinventing programming languages, and that
+the models already know Python better than any of them. Pointing a 27B model at a plain Python
+class, two plain Python libraries, and a SQLite file — and having it research, cite, and
+remember — is the most convincing local-first test of that thesis I've run so far.*
+  </section>
+  <footer>
+    <input type="checkbox" role="switch" id="themeSwitch" />
+  </footer>
+</body>
+</html>
